@@ -79,6 +79,25 @@ purge then deleted running children whose parent had exited. This code never
 ran before because no exit events arrived. It now matches libsinsp: children
 of the exiting thread get the event's reaper tid, or no parent.
 
+### 4. The syscall set goes in the field released daemons read
+
+Found by the soak test. Since the #157 proto sync, the plugin sends its
+syscall set only in `ZoneKernelEventStreamUpdate.source` (tag 3). Protect
+daemons up to v1.13.x read only the old top-level `enabled_syscalls` (tag 2)
+and ignore `source`, so they saw an empty set and zones used their default. On
+a 1.13.1 worker, the table grew by about 850 threads a minute with zero exit
+events. This also means mirror mode's set never reached zones on any released
+Protect.
+
+The public proto no longer has tag 2, so it is hand-added to the generated
+control types (marked `HAND-ADDED`), and the plugin fills both fields. A test
+decodes the request the way a v1.13.x daemon does. Whoever re-syncs the protos
+must keep the field until no supported daemon needs it; the test fails to
+compile if it is dropped.
+
+After the fix, on the same worker: about 8,000 process exits per 5 minutes
+under load, and the table held at 27 entries.
+
 ## Not changed
 
 - **Mirror mode sends the wrong syscall set** ([#165](https://github.com/edera-dev/falco_plugin/issues/165), separate PR). With
