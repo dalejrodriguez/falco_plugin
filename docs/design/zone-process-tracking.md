@@ -48,13 +48,28 @@ none. So the table would grow for as long as Falco runs, and stale entries
 would mislabel reused PIDs.
 
 The plugin now sends an explicit set instead of an empty request (empty means
-"zone default"): the zone default set plus `PPM_SC_SCHED_PROCESS_EXIT`. The
+"zone default"): the zone default set plus `PPM_SC_SCHED_PROCESS_EXIT`. In
+mirror mode it adds process exit to the set read from Falco, and if that map
+can't be read it falls back to the same explicit set. The
 copy matches protect `crates/zone/src/kernel_events.rs` in v1.13.1, v1.13.2 and
 v1.13.4. This works with zones already deployed, without a protect release.
 
-Trade-off: the plugin now carries a copy of the zone's default set. If protect
-changes its default, this copy should be updated to match. A unit test fences
-the process-lifecycle events in the set.
+Trade-off: the plugin now carries a copy of the zone's default set, and the
+copy can drift. Before, the plugin asked for "the default", so Falco users got
+whatever protect's default said. From now on, if a future zone default adds or
+removes events, Falco users won't see that change until someone updates the
+plugin's copy. A unit test fences only the process-lifecycle events in the set,
+not the full list.
+
+Plan to remove the copy:
+
+1. protect adds `PPM_SC_SCHED_PROCESS_EXIT` to the zone default set (drafted
+   with the protect change below).
+2. Once every supported zone version includes it, the plugin goes back to
+   sending an empty request ("zone default") and drops its copy.
+
+Until then, whoever changes protect's zone default should update
+`default_zone_syscalls()` in `src/source_plugin/client/enabled_syscalls.rs`.
 
 ### 3. Children move to the reaper on exit
 
@@ -66,23 +81,31 @@ of the exiting thread get the event's reaper tid, or no parent.
 
 ## Not changed
 
-- **Mirror mode is also broken.** With `mirror_host_syscalls: true`, the plugin
-  reads Falco's `interesting_syscalls_table_64bit` map as libscap `ppm_sc`
-  codes. That map is indexed by the kernel's syscall number, so zones get the
-  wrong set, and tracepoints like process exit are never in it. This needs the
-  syscall-number to `ppm_sc` table and is a separate fix.
+- **Mirror mode sends the wrong syscall set (separate PR).** With
+  `mirror_host_syscalls: true` (the repo's Helm example,
+  `examples/falco-helm-values.yaml`), the plugin reads Falco's
+  `interesting_syscalls_table_64bit` map as libscap `ppm_sc` codes. That map is
+  indexed by the kernel's syscall number, so zones get the wrong set. Fixing it
+  needs the syscall-number to `ppm_sc` table. This change only makes sure mirror
+  mode, and its fallback when the map can't be read, also ask for process exit.
+  Falco's map never holds tracepoints, so mirror mode would otherwise reintroduce
+  the unbounded thread table.
 - **`evt.category` and `evt.count.error.memory`** still show the zone's wrong
   string until zones send correct categories (protect fix below).
 - **Lost exit events** (ring-buffer drops) still leave entries behind. libsinsp
   covers this with periodic `/proc` rescans; the zone snapshot on reconnect is
   the nearest equivalent here. The soak test measures whether it matters.
 
-## protect change (separate)
+## protect changes (separate, not yet proposed)
 
-protect commit `fix(libscap-rs): send syscall event category and flags as bit
-sets` reads the raw bits and formats them as libscap writes them
-(`EC_FILE | EC_SYSCALL`). It fixes `evt.category` for new zones. This plugin
-change does not depend on it.
+- `fix(libscap-rs): send syscall event category and flags as bit sets` reads
+  the raw bits and formats them as libscap writes them (`EC_FILE | EC_SYSCALL`).
+  It fixes `evt.category` for new zones.
+- `fix(zone): include process exit in the default syscall set` adds
+  `PPM_SC_SCHED_PROCESS_EXIT` to the zone default, which removes the need for
+  the plugin's copy (see the plan above).
+
+This plugin change does not depend on either one.
 
 ## Verification
 

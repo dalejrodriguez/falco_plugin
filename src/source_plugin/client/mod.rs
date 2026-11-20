@@ -12,6 +12,7 @@ use crate::proto::generated::protect::control::v1::{
 use edera_client::{client::ControlClientProvider, dial::ControlDialAddress, events::EventStream};
 
 mod zone_creation_watcher;
+use libscap_bindings::types::ppm_sc_code as syscall_codes;
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use tokio::{
@@ -199,17 +200,23 @@ impl Client {
             //
             // By the time falco has finished plugin init and we see zones, the map we scan to get this
             // info should be there.
+            //
+            // Falco's map never includes tracepoints, so add process exit: without it the
+            // thread table never drops exited threads.
             let res = enabled_syscalls::read_enabled_syscalls()
                 .ok()
-                .map(|syscalls| syscalls.into_iter().collect());
+                .map(|mut syscalls| {
+                    syscalls.insert(syscall_codes::PPM_SC_SCHED_PROCESS_EXIT as u32);
+                    syscalls.into_iter().collect()
+                });
 
             if res.is_none() {
-                // if we failed to read the map, fall back on None and the default set will be used
+                // if we failed to read the map, fall back on our default set
                 warn!(
                     "could not read falco's enabled syscalls eBPF map, is the modern eBPF host driver enabled?"
                 )
             }
-            res
+            res.or_else(|| Some(enabled_syscalls::default_zone_syscalls()))
         } else {
             Some(enabled_syscalls::default_zone_syscalls())
         };
