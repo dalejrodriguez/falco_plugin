@@ -3738,6 +3738,161 @@ mod tests {
         assert!(tinfo.args.contains("echo test"));
     }
 
+    /// Builds an event the way zones on Edera 1.13.x send it: every syscall event
+    /// is labelled "EC_TRACEPOINT" (edera-dev/falco_plugin#154).
+    fn zone_event(
+        thread_id: u64,
+        event_type: event_codes,
+        timestamp: u64,
+        params: Vec<ZoneKernelEventParam>,
+    ) -> ZoneKernelSyscallEvent {
+        ZoneKernelSyscallEvent {
+            zone_id: "test-zone".to_string(),
+            thread_id,
+            timestamp,
+            event_type: event_type as u32,
+            event_name: format!("{event_type:?}"),
+            event_category: "EC_TRACEPOINT".to_string(),
+            event_params: params,
+            ..Default::default()
+        }
+    }
+
+    fn i64p(v: i64) -> ZoneKernelEventParam {
+        create_param(0, v.to_ne_bytes().to_vec(), v.to_string())
+    }
+    fn u64p(v: u64) -> ZoneKernelEventParam {
+        create_param(0, v.to_ne_bytes().to_vec(), v.to_string())
+    }
+    fn u32p(v: u32) -> ZoneKernelEventParam {
+        create_param(0, v.to_ne_bytes().to_vec(), v.to_string())
+    }
+    fn strp(s: &str) -> ZoneKernelEventParam {
+        let mut data = s.as_bytes().to_vec();
+        data.push(0);
+        create_param(0, data, s.to_string())
+    }
+    fn emptyp() -> ZoneKernelEventParam {
+        create_param(0, vec![], String::new())
+    }
+
+    /// Replays what w4 showed for `kubectl exec ... cat /etc/shadow` in an Edera zone:
+    /// a known process forks a child inside a PID namespace (child-side clone event,
+    /// retval 0), the child execs `cat`, and `cat` opens /etc/shadow. With every event
+    /// labelled "EC_TRACEPOINT", the plugin used to ignore all return values, so the
+    /// child was never added, and the open recorded no file name.
+    #[test]
+    fn new_process_in_pidns_is_tracked_despite_tracepoint_category() {
+        let mut state = ThreadState::default();
+        let mut parent = create_thread_info(100, 100);
+        parent.exe = "/bin/styrolite".to_string();
+        let mut thread_info = HashMap::new();
+        thread_info.insert(100, parent);
+        state.init_zone_with_snap(ZoneKernelThreadSnapshotEvent {
+            zone_id: "test-zone".to_string(),
+            thread_info,
+            zone_boot_epoch: 0,
+        });
+
+        // fork(), as seen by the child: [res, exe, args, tid, pid, ptid, cwd, fdlimit,
+        // pgft_maj, pgft_min, vm_size, vm_rss, vm_swap, comm, cgroups, flags, uid, gid,
+        // vtid, vpid, pidns_init_start_ts]
+        let fork_child = zone_event(
+            101,
+            event_codes::PPME_SYSCALL_FORK_20_X,
+            1_000,
+            vec![
+                i64p(0),
+                strp("/bin/styrolite"),
+                strp("styrolite"),
+                i64p(101),
+                i64p(101),
+                i64p(100),
+                emptyp(),
+                i64p(1024),
+                u64p(0),
+                u64p(0),
+                u32p(0),
+                u32p(0),
+                u32p(0),
+                strp("styrolite"),
+                emptyp(),
+                u32p(ppm_consts::PPM_CL_CHILD_IN_PIDNS),
+                u32p(0),
+                u32p(0),
+                i64p(6),
+                i64p(6),
+                u64p(0),
+            ],
+        );
+        state.process_event(&fork_child).unwrap();
+        assert!(
+            state
+                .with_threadinfo("test-zone", &101, |_| Some(()))
+                .is_some(),
+            "child of fork() must be added to the thread table"
+        );
+
+        // execve(): [res, exe, args, tid, pid, ptid, cwd, fdlimit, pgft_maj, pgft_min,
+        // vm_size, vm_rss, vm_swap, comm, ...optional params left empty]
+        let mut execve_params = vec![
+            i64p(0),
+            strp("/bin/cat"),
+            strp("/etc/shadow"),
+            i64p(101),
+            u64p(101),
+            u64p(100),
+            emptyp(),
+            i64p(1024),
+            u64p(0),
+            u64p(0),
+            u32p(0),
+            u32p(0),
+            u32p(0),
+            strp("cat"),
+        ];
+        execve_params.resize_with(30, emptyp);
+        let execve = zone_event(
+            101,
+            event_codes::PPME_SYSCALL_EXECVE_19_X,
+            2_000,
+            execve_params,
+        );
+        state.process_event(&execve).unwrap();
+        assert_eq!(
+            state
+                .with_threadinfo("test-zone", &101, |t| Some(t.exe.clone()))
+                .as_deref(),
+            Some("/bin/cat")
+        );
+
+        // open(): [fd, name, flags, mode, dev, ino]
+        let mut fd_param = i64p(3);
+        fd_param.param_type = param_type::PT_FD as u32;
+        let open = zone_event(
+            101,
+            event_codes::PPME_SYSCALL_OPEN_X,
+            3_000,
+            vec![
+                fd_param,
+                strp("/etc/shadow"),
+                u32p(ppm_consts::PPM_O_RDONLY),
+                u32p(0),
+                u32p(0),
+                u64p(0),
+            ],
+        );
+        state.process_event(&open).unwrap();
+
+        let fdinfo = state
+            .with_zoneinfo("test-zone", |z| z.get_event_fdinfo(&open))
+            .expect("open must record fd 3 for the new process");
+        match fdinfo.info.and_then(|i| i.info_type) {
+            Some(InfoType::RegularFile(f)) => assert_eq!(f.name, "/etc/shadow"),
+            other => panic!("expected a regular file, got {other:?}"),
+        }
+    }
+
     #[test]
     fn mark_fd_dropped() {
         let mut state = ThreadState::default();
