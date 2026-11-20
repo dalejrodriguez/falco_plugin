@@ -211,7 +211,7 @@ impl Client {
             }
             res
         } else {
-            None
+            Some(enabled_syscalls::default_zone_syscalls())
         };
 
         // Get the stored client and sender

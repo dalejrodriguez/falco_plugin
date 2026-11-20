@@ -1775,6 +1775,7 @@ impl ZoneInfo {
                 )
                 .try_into()
                 .ok()
+                .filter(|&reaper: &u64| reaper > 0)
             } else {
                 None
             }
@@ -1783,9 +1784,10 @@ impl ZoneInfo {
         // Move any children of this thread to the reaper thread, if the event defines one.
         // Otherwise, orphan them. Note that as per libsinsp you cannot derive reaper thread
         // info from /proc scans, so this event is very much best effort/the only place to get reaper info
+        let exiting_tid = event.thread_id;
         self.with_mut_threadsnaps_ctx(|threadsnaps| {
             for tinfo in threadsnaps.values_mut() {
-                if tinfo.ptid.is_some() && tinfo.ptid == tinfo.tid {
+                if tinfo.ptid == Some(exiting_tid) {
                     tinfo.ptid = reaper_tid; // if reapertid is Some(u64), set that. Otherwise, set to None/orphan.
                 }
             }
@@ -3776,38 +3778,21 @@ mod tests {
         create_param(0, vec![], String::new())
     }
 
-    /// Replays what w4 showed for `kubectl exec ... cat /etc/shadow` in an Edera zone:
-    /// a known process forks a child inside a PID namespace (child-side clone event,
-    /// retval 0), the child execs `cat`, and `cat` opens /etc/shadow. With every event
-    /// labelled "EC_TRACEPOINT", the plugin used to ignore all return values, so the
-    /// child was never added, and the open recorded no file name.
-    #[test]
-    fn new_process_in_pidns_is_tracked_despite_tracepoint_category() {
-        let mut state = ThreadState::default();
-        let mut parent = create_thread_info(100, 100);
-        parent.exe = "/bin/styrolite".to_string();
-        let mut thread_info = HashMap::new();
-        thread_info.insert(100, parent);
-        state.init_zone_with_snap(ZoneKernelThreadSnapshotEvent {
-            zone_id: "test-zone".to_string(),
-            thread_info,
-            zone_boot_epoch: 0,
-        });
-
-        // fork(), as seen by the child: [res, exe, args, tid, pid, ptid, cwd, fdlimit,
-        // pgft_maj, pgft_min, vm_size, vm_rss, vm_swap, comm, cgroups, flags, uid, gid,
-        // vtid, vpid, pidns_init_start_ts]
-        let fork_child = zone_event(
-            101,
+    /// fork() as seen by the child, which runs in a PID namespace: [res, exe, args, tid,
+    /// pid, ptid, cwd, fdlimit, pgft_maj, pgft_min, vm_size, vm_rss, vm_swap, comm,
+    /// cgroups, flags, uid, gid, vtid, vpid, pidns_init_start_ts]
+    fn fork_child_event(child: u64, parent: u64, vtid: i64, ts: u64) -> ZoneKernelSyscallEvent {
+        zone_event(
+            child,
             event_codes::PPME_SYSCALL_FORK_20_X,
-            1_000,
+            ts,
             vec![
                 i64p(0),
                 strp("/bin/styrolite"),
                 strp("styrolite"),
-                i64p(101),
-                i64p(101),
-                i64p(100),
+                i64p(child as i64),
+                i64p(child as i64),
+                i64p(parent as i64),
                 emptyp(),
                 i64p(1024),
                 u64p(0),
@@ -3820,11 +3805,104 @@ mod tests {
                 u32p(ppm_consts::PPM_CL_CHILD_IN_PIDNS),
                 u32p(0),
                 u32p(0),
-                i64p(6),
-                i64p(6),
+                i64p(vtid),
+                i64p(vtid),
                 u64p(0),
             ],
+        )
+    }
+
+    /// Process exit: [status, ret, sig, core, reaper_tid]
+    fn procexit_event(tid: u64, reaper: i64, ts: u64) -> ZoneKernelSyscallEvent {
+        zone_event(
+            tid,
+            event_codes::PPME_PROCEXIT_1_E,
+            ts,
+            vec![
+                i64p(0),
+                i64p(0),
+                create_param(0, vec![0], String::new()),
+                create_param(0, vec![0], String::new()),
+                i64p(reaper),
+            ],
+        )
+    }
+
+    fn snapshot_with_parent(state: &mut ThreadState) {
+        let mut parent = create_thread_info(100, 100);
+        parent.exe = "/bin/styrolite".to_string();
+        let mut thread_info = HashMap::new();
+        thread_info.insert(100, parent);
+        // An unrelated process whose exit triggers the dead-thread purge.
+        thread_info.insert(200, create_thread_info(200, 200));
+        state.init_zone_with_snap(ZoneKernelThreadSnapshotEvent {
+            zone_id: "test-zone".to_string(),
+            thread_info,
+            zone_boot_epoch: 0,
+        });
+    }
+
+    fn known(state: &ThreadState, tid: u64) -> bool {
+        state
+            .with_threadinfo("test-zone", &tid, |_| Some(()))
+            .is_some()
+    }
+
+    #[test]
+    fn exited_processes_leave_the_thread_table() {
+        let mut state = ThreadState::default();
+        snapshot_with_parent(&mut state);
+
+        for (i, child) in (101..111u64).enumerate() {
+            let ts = 1_000 + i as u64 * 10;
+            state
+                .process_event(&fork_child_event(child, 100, child as i64, ts))
+                .unwrap();
+            state
+                .process_event(&procexit_event(child, 0, ts + 1))
+                .unwrap();
+        }
+        // The last exiting thread stays until the next exit, for rule context.
+        state.process_event(&procexit_event(200, 0, 5_000)).unwrap();
+
+        let table_len = state
+            .with_zoneinfo("test-zone", |z| Some(z.seen_threadsnaps.len()))
+            .unwrap();
+        // 100 is alive; 200 just exited and stays until the next exit.
+        assert_eq!(table_len, 2, "every exited child should be gone");
+    }
+
+    #[test]
+    fn children_of_an_exited_process_move_to_the_reaper_and_stay() {
+        let mut state = ThreadState::default();
+        snapshot_with_parent(&mut state);
+        state
+            .process_event(&fork_child_event(101, 100, 6, 1_000))
+            .unwrap();
+
+        state.process_event(&procexit_event(100, 1, 2_000)).unwrap();
+        assert_eq!(
+            state.with_threadinfo("test-zone", &101, |t| t.ptid),
+            Some(1)
         );
+
+        // A later exit purges the dead parent; its running child must survive.
+        state.process_event(&procexit_event(200, 0, 3_000)).unwrap();
+        assert!(!known(&state, 100));
+        assert!(known(&state, 101));
+    }
+
+    /// Replays what w4 showed for `kubectl exec ... cat /etc/shadow` in an Edera zone:
+    /// a known process forks a child inside a PID namespace (child-side clone event,
+    /// retval 0), the child execs `cat`, and `cat` opens /etc/shadow. With every event
+    /// labelled "EC_TRACEPOINT", the plugin used to ignore all return values, so the
+    /// child was never added, and the open recorded no file name.
+    #[test]
+    fn new_process_in_pidns_is_tracked_despite_tracepoint_category() {
+        let mut state = ThreadState::default();
+        snapshot_with_parent(&mut state);
+
+        let fork_child = fork_child_event(101, 100, 6, 1_000);
         state.process_event(&fork_child).unwrap();
         assert!(
             state
