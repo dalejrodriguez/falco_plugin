@@ -63,8 +63,8 @@ not the full list.
 
 Plan to remove the copy:
 
-1. protect adds `PPM_SC_SCHED_PROCESS_EXIT` to the zone default set (drafted
-   with the protect change below).
+1. protect adds `PPM_SC_SCHED_PROCESS_EXIT` to the zone default set
+   ([edera-dev/protect#5079](https://github.com/edera-dev/protect/pull/5079)).
 2. Once every supported zone version includes it, the plugin goes back to
    sending an empty request ("zone default") and drops its copy.
 
@@ -96,12 +96,14 @@ of the exiting thread get the event's reaper tid, or no parent.
   covers this with periodic `/proc` rescans; the zone snapshot on reconnect is
   the nearest equivalent here. The soak test measures whether it matters.
 
-## protect changes (separate, not yet proposed)
+## protect changes (separate PRs)
 
-- `fix(libscap-rs): send syscall event category and flags as bit sets` reads
+- [edera-dev/protect#5078](https://github.com/edera-dev/protect/pull/5078),
+  `fix(libscap-rs): send syscall event category and flags as bit sets`, reads
   the raw bits and formats them as libscap writes them (`EC_FILE | EC_SYSCALL`).
   It fixes `evt.category` for new zones.
-- `fix(zone): include process exit in the default syscall set` adds
+- [edera-dev/protect#5079](https://github.com/edera-dev/protect/pull/5079),
+  `fix(zone): include process exit in the default syscall set`, adds
   `PPM_SC_SCHED_PROCESS_EXIT` to the zone default, which removes the need for
   the plugin's copy (see the plan above).
 
