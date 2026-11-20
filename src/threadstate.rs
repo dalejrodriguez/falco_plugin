@@ -3892,6 +3892,83 @@ mod tests {
         assert!(known(&state, 101));
     }
 
+    /// execve(): [res, exe, args, tid, pid, ptid, cwd, fdlimit, pgft_maj, pgft_min,
+    /// vm_size, vm_rss, vm_swap, comm, ...optional params left empty]
+    fn execve_event(tid: u64, parent: u64, exe: &str, ts: u64) -> ZoneKernelSyscallEvent {
+        let comm = exe.rsplit('/').next().unwrap_or(exe);
+        let mut params = vec![
+            i64p(0),
+            strp(exe),
+            strp(comm),
+            i64p(tid as i64),
+            u64p(tid),
+            u64p(parent),
+            emptyp(),
+            i64p(1024),
+            u64p(0),
+            u64p(0),
+            u32p(0),
+            u32p(0),
+            u32p(0),
+            strp(comm),
+        ];
+        params.resize_with(30, emptyp);
+        zone_event(tid, event_codes::PPME_SYSCALL_EXECVE_19_X, ts, params)
+    }
+
+    fn exe_of(state: &ThreadState, tid: u64) -> Option<String> {
+        state.with_threadinfo("test-zone", &tid, |t| Some(t.exe.clone()))
+    }
+
+    #[test]
+    fn reused_pid_reports_the_new_program() {
+        let mut state = ThreadState::default();
+        snapshot_with_parent(&mut state);
+
+        state
+            .process_event(&fork_child_event(101, 100, 6, 1_000))
+            .unwrap();
+        state
+            .process_event(&execve_event(101, 100, "/bin/cat", 2_000))
+            .unwrap();
+        state.process_event(&procexit_event(101, 0, 3_000)).unwrap();
+        state.process_event(&procexit_event(200, 0, 4_000)).unwrap();
+        assert!(!known(&state, 101), "exited process must be purged");
+
+        // The zone hands PID 101 to a new process, seconds later.
+        state
+            .process_event(&fork_child_event(101, 100, 7, 10_000_000_000))
+            .unwrap();
+        state
+            .process_event(&execve_event(101, 100, "/bin/ls", 10_000_001_000))
+            .unwrap();
+        assert_eq!(exe_of(&state, 101).as_deref(), Some("/bin/ls"));
+    }
+
+    #[test]
+    fn reused_pid_replaces_a_stale_entry_when_the_exit_was_missed() {
+        let mut state = ThreadState::default();
+        snapshot_with_parent(&mut state);
+
+        state
+            .process_event(&fork_child_event(101, 100, 6, 1_000))
+            .unwrap();
+        state
+            .process_event(&execve_event(101, 100, "/bin/cat", 2_000))
+            .unwrap();
+
+        // No exit event for the old 101 (e.g. dropped); a new process gets PID 101
+        // more than two seconds after the old one was cloned.
+        state
+            .process_event(&fork_child_event(101, 100, 7, 10_000_000_000))
+            .unwrap();
+        assert_eq!(exe_of(&state, 101).as_deref(), Some("/bin/styrolite"));
+        state
+            .process_event(&execve_event(101, 100, "/bin/ls", 10_000_001_000))
+            .unwrap();
+        assert_eq!(exe_of(&state, 101).as_deref(), Some("/bin/ls"));
+    }
+
     /// Replays what w4 showed for `kubectl exec ... cat /etc/shadow` in an Edera zone:
     /// a known process forks a child inside a PID namespace (child-side clone event,
     /// retval 0), the child execs `cat`, and `cat` opens /etc/shadow. With every event
