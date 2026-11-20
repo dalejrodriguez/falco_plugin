@@ -253,6 +253,23 @@ impl Client {
         Ok(())
     }
 
+    /// Daemons up to Protect v1.13.x read the syscall set only from the top-level
+    /// `enabled_syscalls` field; newer daemons read `source`. Send both, or released
+    /// daemons see an empty set and zones fall back to their default.
+    fn syscall_stream_request(zone_id: &str, syscalls: Vec<u32>) -> MonitorZoneKernelEventRequest {
+        MonitorZoneKernelEventRequest {
+            zone_id: zone_id.to_string(),
+            request: Some(zk_req::Request::Update(ZoneKernelEventStreamUpdate {
+                enabled_syscalls: syscalls.clone(),
+                source: Some(zone_kernel_event_stream_update::Source::Syscalls(
+                    ZoneKernelSyscallSource {
+                        enabled_syscalls: syscalls,
+                    },
+                )),
+            })),
+        }
+    }
+
     async fn run_syscall_stream(
         mut client: ControlServiceClient<Channel>,
         handler: mpsc::UnboundedSender<MonitorZoneKernelEventReply>,
@@ -262,16 +279,7 @@ impl Client {
         zone_exit_tx: mpsc::UnboundedSender<String>,
     ) -> Result<JoinSet<()>> {
         debug!("listening for kernel events from zone {}", zone_id);
-        let event = MonitorZoneKernelEventRequest {
-            zone_id: zone_id.clone(),
-            request: Some(zk_req::Request::Update(ZoneKernelEventStreamUpdate {
-                source: Some(zone_kernel_event_stream_update::Source::Syscalls(
-                    ZoneKernelSyscallSource {
-                        enabled_syscalls: enabled_syscalls.unwrap_or_default(),
-                    },
-                )),
-            })),
-        };
+        let event = Self::syscall_stream_request(&zone_id, enabled_syscalls.unwrap_or_default());
         let stream = Self::input_stream_kernel_events(event, cancel_rx);
 
         debug!("built stream");
@@ -364,5 +372,37 @@ impl Client {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+
+    /// The update message as Protect v1.13.x daemons decode it.
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct LegacyUpdate {
+        #[prost(uint32, repeated, tag = "2")]
+        enabled_syscalls: Vec<u32>,
+    }
+
+    #[test]
+    fn released_daemons_read_the_requested_syscalls() {
+        let syscalls = enabled_syscalls::default_zone_syscalls();
+        let request = Client::syscall_stream_request("zone", syscalls.clone());
+        let Some(zk_req::Request::Update(update)) = request.request else {
+            panic!("expected an update request");
+        };
+        let legacy = LegacyUpdate::decode(update.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(legacy.enabled_syscalls, syscalls);
+        assert_eq!(
+            update.source,
+            Some(zone_kernel_event_stream_update::Source::Syscalls(
+                ZoneKernelSyscallSource {
+                    enabled_syscalls: syscalls
+                }
+            ))
+        );
     }
 }
