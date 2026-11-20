@@ -81,7 +81,7 @@ of the exiting thread get the event's reaper tid, or no parent.
 
 ## Not changed
 
-- **Mirror mode sends the wrong syscall set (separate PR).** With
+- **Mirror mode sends the wrong syscall set** ([#165](https://github.com/edera-dev/falco_plugin/issues/165), separate PR). With
   `mirror_host_syscalls: true` (the repo's Helm example,
   `examples/falco-helm-values.yaml`), the plugin reads Falco's
   `interesting_syscalls_table_64bit` map as libscap `ppm_sc` codes. That map is
