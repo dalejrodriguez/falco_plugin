@@ -81,7 +81,7 @@ of the exiting thread get the event's reaper tid, or no parent.
 
 ### 4. The syscall set goes in the field released daemons read
 
-Found by the soak test. Since the #157 proto sync, the plugin sends its
+Found by the stress test. Since the #157 proto sync, the plugin sends its
 syscall set only in `ZoneKernelEventStreamUpdate.source` (tag 3). Protect
 daemons up to v1.13.x read only the old top-level `enabled_syscalls` (tag 2)
 and ignore `source`, so they saw an empty set and zones used their default. On
@@ -113,7 +113,8 @@ under load, and the table held at 27 entries.
   string until zones send correct categories (protect fix below).
 - **Lost exit events** (ring-buffer drops) still leave entries behind. libsinsp
   covers this with periodic `/proc` rescans; the zone snapshot on reconnect is
-  the nearest equivalent here. The soak test measures whether it matters.
+  the nearest equivalent here. The 24-hour soak showed no buildup (see
+  Verification).
 
 ## protect changes (separate PRs)
 
@@ -130,16 +131,19 @@ This plugin change does not depend on either one.
 
 ## Verification
 
-- Unit tests (61 pass): return values with any category string; a replay of the
-  captured sequence (fork child in a PID namespace, `execve cat`, `open
-  /etc/shadow`); exited children leaving the table; running children surviving
-  their parent. The replay and reparent tests fail on the old code.
-- Before release, on one Xen worker:
-  1. Stress test, about 30 minutes: about 1,000 short-lived processes per
-     minute in an Edera pod. Pass: process-exit events arrive, and the table
-     stays near the live process count.
-  2. PID reuse: run enough processes to reuse PIDs. Pass: Falco reports the new
-     program's name.
-  3. 24-hour soak with normal workload. Pass: Falco memory is flat after
-     warm-up, and the `/etc/shadow` rule fires with the right file and
-     program.
+- Unit tests (64 pass on arm64 and x86_64): return values with any category
+  string; a replay of the captured sequence (fork child in a PID namespace,
+  `execve cat`, `open /etc/shadow`); exited children leaving the table; running
+  children surviving their parent; reused PIDs reporting the new program. The
+  replay and reparent tests fail on the old code.
+- On one Xen worker (Edera 1.13.1, Falco 0.45.2), 2026-11-20 to 2026-11-21:
+  1. Stress test, 30 minutes at about 1,000 short-lived processes per minute
+     (about 28,000 total): exits matched execs in every 5-minute window, the
+     table held at 27, and Falco RSS went from 100.2 MB to 102.9 MB.
+  2. PID reuse: zones allow PIDs up to 4,194,304, so a test run can't make
+     them wrap. Covered by unit tests instead (normal exit, and a missed exit).
+  3. 24-hour soak, about 100 processes per minute plus `cat /etc/shadow` every
+     10 minutes: Falco RSS stayed between 102.2 and 104.5 MB (102.3 MB at the
+     end), the table stayed at 26 to 27, exits matched execs in every window,
+     the rule fired every 10 minutes with `process=cat`, and Falco never
+     restarted. When a second test zone shut down, its threads left the table.
